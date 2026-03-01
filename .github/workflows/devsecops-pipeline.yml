@@ -1,0 +1,122 @@
+name: "Enterprise IAM DevSecOps Pipeline"
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  id-token: write # Required for Azure OIDC login
+  contents: read
+
+jobs:
+  security-scans:
+    name: "Infrastructure Security Scans (tfsec & checkov)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: ./environments/dev
+          soft_fail: false # Hard fail on security issues
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ./
+          framework: terraform
+          soft_fail: false
+          skip_check: CKV_AZURE_42 # Example, skip if a known accepted risk
+
+  terraform-plan:
+    name: "Terraform Format, Validate and Plan"
+    needs: security-scans
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Terraform Format Check
+        id: fmt
+        working-directory: ./environments/\${{ matrix.environment }}
+        run: terraform fmt -check -recursive ../../
+
+      - name: Login to Azure using OIDC
+        uses: azure/login@v1
+        with:
+          client-id: \${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: \${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: \${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        id: init
+        working-directory: ./environments/\${{ matrix.environment }}
+        run: terraform init
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ./environments/\${{ matrix.environment }}
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./environments/\${{ matrix.environment }}
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Upload TF Plan as Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfplan-\${{ matrix.environment }}
+          path: ./environments/\${{ matrix.environment }}/tfplan
+
+  terraform-apply:
+    name: "Terraform Apply (\${{ matrix.environment }})"
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    environment:
+      name: \${{ matrix.environment }}
+      url: https://portal.azure.com
+    strategy:
+      matrix:
+        # We only apply on push to main or via manual triggers, PRs only plan
+        environment: [dev, staging, prod]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Download TF Plan Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: tfplan-\${{ matrix.environment }}
+          path: ./environments/\${{ matrix.environment }}
+
+      - name: Login to Azure using OIDC
+        uses: azure/login@v1
+        with:
+          client-id: \${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: \${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: \${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Apply
+        # Hard requirement to require manual approval on 'prod' using GitHub Environments
+        if: github.ref == 'refs/heads/main'
+        working-directory: ./environments/\${{ matrix.environment }}
+        run: terraform apply -auto-approve tfplan
